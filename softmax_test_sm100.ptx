@@ -1,0 +1,282 @@
+我将为这段PTX代码的每一行添加详细注释，解释其功能和实现原理：
+
+```ptx
+// PTX版本和目标架构声明
+.version 8.7          // PTX ISA版本8.7
+.target sm_100        // 目标计算能力7.0
+.address_size 64      // 64位地址空间
+
+// 内核函数声明
+.visible .entry _Z26softmax_f32_per_mat_kernelILi256EEvPfPKfii(
+    .param .u64 _Z26softmax_f32_per_mat_kernelILi256EEvPfPKfii_param_0,  // 输出指针参数
+    .param .u64 _Z26softmax_f32_per_mat_kernelILi256EEvPfPKfii_param_1,  // 输入指针参数
+    .param .u32 _Z26softmax_f32_per_mat_kernelILi256EEvPfPKfii_param_2,  // 行数N
+    .param .u32 _Z26softmax_f32_per_mat_kernelILi256EEvPfPKfii_param_3   // 列数C
+)
+{
+    // 寄存器声明
+    .reg .pred %p<22>;  // 谓词寄存器(用于条件判断)
+    .reg .b32 %r<51>;   // 32位整数寄存器
+    .reg .f32 %f<85>;   // 32位浮点寄存器
+    .reg .b64 %rd<26>;  // 64位整数寄存器(地址)
+
+    // 共享内存声明(64字节)
+    .shared .align 4 .b8 _ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared[64];
+
+    // 加载参数
+    ld.param.u64 %rd4, [_Z26softmax_f32_per_mat_kernelILi256EEvPfPKfii_param_0];  // 加载输出指针         (%rd4 = 输出指针)
+    ld.param.u64 %rd5, [_Z26softmax_f32_per_mat_kernelILi256EEvPfPKfii_param_1];  // 加载输入指针         (%rd5 = 输入指针)
+    ld.param.u32 %r15, [_Z26softmax_f32_per_mat_kernelILi256EEvPfPKfii_param_3];   // 加载列数C           (%r15 = 列数C)
+
+    // 转换全局内存地址
+    cvta.to.global.u64 %rd1, %rd5;  // 输入指针转为全局地址                    (%rd1 = 全局输入指针inp)
+    cvta.to.global.u64 %rd2, %rd4;  // 输出指针转为全局地址                    (%rd2 = 全局输出指针out)
+
+    // 获取线程和块信息
+    mov.u32 %r16, %ctaid.x;         // 当前block的x索引(行索引)                (%r16 = blockIdx.x)
+    mov.u32 %r50, %tid.x;           // 当前线程在block内的x索引                (%r50 = threadIdx.x)
+    and.b32 %r2, %r50, 31;          // 计算lane ID(0-31)                      (%r2 = warp内的线程id)
+
+    // 计算当前行在矩阵中的偏移量
+    mul.lo.s32 %r17, %r15, %r16;    // 行偏移 = C * blockIdx.x
+    cvt.s64.s32 %rd3, %r17;         // 转换为64位                             (%rd3 = 行偏移row_offset = C * blockIdx.x)
+
+    // 检查线程是否越界
+    setp.ge.s32 %p1, %r50, %r15;    // 如果tid >= C，设置谓词%p1
+    mov.f32 %f82, 0fFF800000;       // 初始化maxval为-INF                     (%f82 = 变量maxval)
+    @%p1 bra $L__BB0_3;             // 如果越界则跳转
+
+    // 未越界线程继续执行
+    mov.f32 %f82, 0fFF800000;       // 再次初始化maxval
+    mov.u32 %r3, %ntid.x;           // 获取block中的线程数                     (%r3 = blockDim.x)
+    mov.u32 %r47, %r50;             // 初始化循环计数器                        (%r47 = 32位循环计数器)
+
+// 循环计算局部最大值(跨步访问)
+$L__BB0_2:
+    cvt.s64.s32 %rd6, %r47;         // 将线程索引转为64位                      (%rd6 = 64位循环计数器i)
+    add.s64 %rd7, %rd6, %rd3;       // 计算全局索引: row_offset + tid          
+    shl.b64 %rd8, %rd7, 2;          // 乘以4(浮点数大小)
+    add.s64 %rd9, %rd1, %rd8;       // 计算输入内存地址                        (%rd9 = 当前数据的全局偏移量&x[i])
+    ld.global.f32 %f13, [%rd9];     // 加载输入值                              (%f13 = 当前数据值x[i])
+    max.f32 %f82, %f82, %f13;       // 更新局部最大值
+    add.s32 %r47, %r47, %r3;        // 增加步长(跨步访问)
+    setp.lt.s32 %p2, %r47, %r15;    // 检查是否越界(判断 i < C 是否为真)
+    @%p2 bra $L__BB0_2;             // 继续循环
+
+// Warp内归约(使用shuffle指令)
+$L__BB0_3:
+    mov.b32 %r18, %f82;             // float转到二进制整形                     (%r18 = 二进制整形的变量maxval)
+    
+    // Butterfly式归约(16->8->4->2->1)
+    shfl.sync.bfly.b32 %r19|%p3, %r18, 16, 31, -1;  // 跨16个lane交换         (%r19 = 获得跨16个lane线程的交换数据)
+    mov.b32 %f14, %r19;             // 转回float
+    max.f32 %f15, %f82, %f14;       // 比较并保留最大值                        (%f15 = 取变量maxval与交换数据的最大值)
+    mov.b32 %r20, %f15;             // 再次转为二进制整形
+    shfl.sync.bfly.b32 %r21|%p4, %r20, 8, 31, -1;   // 跨8个lane交换
+    mov.b32 %f16, %r21;
+    max.f32 %f17, %f15, %f16;
+    mov.b32 %r22, %f17;
+    shfl.sync.bfly.b32 %r23|%p5, %r22, 4, 31, -1;   // 跨4个lane交换
+    mov.b32 %f18, %r23;
+    max.f32 %f19, %f17, %f18;
+    mov.b32 %r24, %f19;
+    shfl.sync.bfly.b32 %r25|%p6, %r24, 2, 31, -1;   // 跨2个lane交换
+    mov.b32 %f20, %r25;
+    max.f32 %f21, %f19, %f20;
+    mov.b32 %r26, %f21;
+    shfl.sync.bfly.b32 %r27|%p7, %r26, 1, 31, -1;    // 跨1个lane交换
+    mov.b32 %f22, %r27;
+    max.f32 %f4, %f21, %f22;        // 最终warp内最大值                        (%f4 = warp内的最大值)
+
+    // 准备共享内存地址（由每个warp内的0号线程负责将warp最大数据写入对应warp_id位置的共享内存）
+    setp.ne.s32 %p8, %r2, 0;        // 检查是否是lane 0
+    shr.u32 %r28, %r50, 3;          // tid / 8 
+    and.b32 %r29, %r28, 124;        // (tid/8 & 31)*4 (对齐到4字节)            (%r29 = 共享内存maxvals中当前warp_id)
+    mov.u32 %r30, _ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared;    (%r30 = 共享内存maxvals的首地址)
+    add.s32 %r6, %r30, %r29;        // 计算共享内存地址                         (%r6 = 共享内存地址&maxvals[warp_id])
+
+    // 存储warp最大值到共享内存
+    @%p8 bra $L__BB0_5;             // 非lane 0跳过存储
+    st.shared.f32 [%r6], %f4;       // lane 0存储结果
+
+// 跨warp归约Max最大值
+$L__BB0_5:
+    bar.sync 0;                     // 同步所有线程
+    setp.ne.s32 %p9, %r50, 0;       // 检查是否是线程0
+    @%p9 bra $L__BB0_7;             // 非线程0跳过
+
+    // 线程0归约所有warp的最大值
+    ld.shared.f32 %f23, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared];            (%f23 = 取第一个warp的最大值maxvals[0])
+    ld.shared.f32 %f24, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+4];          (%f24 = 取第二个warp的最大值maxvals[1])
+    max.f32 %f25, %f23, %f24;
+
+    // 下面同理可得，继续比较所有warp的结果(共8个warp)
+	ld.shared.f32 	%f26, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+8];
+	max.f32 	%f27, %f25, %f26;
+	ld.shared.f32 	%f28, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+12];
+	max.f32 	%f29, %f27, %f28;
+	ld.shared.f32 	%f30, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+16];
+	max.f32 	%f31, %f29, %f30;
+	ld.shared.f32 	%f32, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+20];
+	max.f32 	%f33, %f31, %f32;
+	ld.shared.f32 	%f34, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+24];
+	max.f32 	%f35, %f33, %f34;
+	ld.shared.f32 	%f36, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+28];
+	max.f32 	%f37, %f35, %f36;                                                             (%f37 = 共享内存中maxvals的最大值，一整行的最大值)
+
+    st.shared.f32 [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared], %f37; // 存储全局最大值maxvals[0]
+
+
+// 计算当前值的exp(x - max)
+$L__BB0_7:
+    setp.ge.s32 %p10, %r50, %r15;   // 检查线程是否越界(判断 threadIdx.x >= C 是否为真)
+    bar.sync 0;                     // 再次同步
+    mov.f32 %f84, 0f00000000;       // 初始化sum为0
+    @%p10 bra $L__BB0_12;          // 越界线程跳过
+
+    ld.shared.f32 %f5, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared]; // 加载最大值
+    mov.u32 %r7, %ntid.x;          // 获取block内的线程数                                      (%r7 = blockDim.x)
+    cvt.u32.u64 %r31, %rd3;        // 行偏移转为32位                                           (%r31 = 32位的行偏移row_offset)
+    mov.u32 %r48, %r50;            // 初始化循环计数器j (初始化为threadIdx.x , 范围是 [0, C-1] ) 
+
+// 计算exp(x - max)循环
+$L__BB0_9:
+    cvt.s64.s32 %rd10, %r48;       // 转为64位                                                (%rd10 = 64位的threadIdx.x)
+    add.s64 %rd11, %rd10, %rd3;    // 计算全局索引                                             (%rd11 = 当前行的全局输入索引)
+    shl.b64 %rd12, %rd11, 2;       // 乘以4
+    add.s64 %rd13, %rd1, %rd12;    // 输入地址                                                 (%rd13 = 当前数据的全局偏移量&x[j])
+    ld.global.f32 %f39, [%rd13];   // 加载输入值                                               (%f39 = 取得当前数据x[j])
+    
+    // 快速指数近似计算
+    sub.f32 %f40, %f39, %f5;       // x - max (数值稳定)                                       (%f40 = x[j] - 最大值)
+    fma.rn.f32 %f41, %f40, 0f3BBB989D, 0f3F000000; // 0.0055*x + 0.5
+    cvt.sat.f32.f32 %f42, %f41;    // 饱和转换
+    mov.f32 %f43, 0f4B400001;      // 8388608.5
+    mov.f32 %f44, 0f437C0000;      // 252.0
+    fma.rm.f32 %f45, %f42, %f44, %f43; // t = 252*y + 8388608.5
+    add.f32 %f46, %f45, 0fCB40007F; // t += -8388608.5
+    neg.f32 %f47, %f46;            // -t
+    fma.rn.f32 %f48, %f40, 0f3FB8AA3B, %f47; // log2(e)*x - t
+    fma.rn.f32 %f49, %f40, 0f32A57060, %f48; // 加上小量
+    mov.b32 %r32, %f45;            // 取整数部分
+    shl.b32 %r33, %r32, 23;        // 构造浮点数的指数部分
+    mov.b32 %f50, %r33;            // 转回float
+    ex2.approx.ftz.f32 %f51, %f49; // 快速2^x近似
+    mul.f32 %f52, %f51, %f50;      // 最终exp结果                                              (%f52 = 最终近似结果exp(x - max))
+    
+    // 存储结果
+    add.s32 %r34, %r48, %r31;      // 计算输出索引                                             (%r34 = 当前行的全局输出索引row_offset + 行索引)
+    mul.wide.s32 %rd14, %r34, 4;   // 乘以4
+    add.s64 %rd15, %rd2, %rd14;    // 输出地址                                                 (%rd15 = 当前输出地址&out[row_offset + 行索引])
+    st.global.f32 [%rd15], %f52;   // 存储结果exp(x - max)到全局内存
+    
+    add.s32 %r48, %r48, %r7;       // 增加步长
+    setp.lt.s32 %p11, %r48, %r15;  // 检查是否越界
+    @%p11 bra $L__BB0_9;           // 继续循环
+
+    // 计算求和
+    mov.f32 %f84, 0f00000000;      // 重置sum
+    mov.u32 %r49, %r50;            // 重置循环计数器                                           (%r49 = 累加的循环计数器初始化为threadIdx.x)
+
+$L__BB0_11:
+    cvt.s64.s32 %rd16, %r49;       // 转为64位                                                (%rd16 = 64位的累加循环计数器)
+    add.s64 %rd17, %rd16, %rd3;    // 全局索引                                                (%rd17 = 行偏移row_offset + 行索引)
+    shl.b64 %rd18, %rd17, 2;       // 乘以4
+    add.s64 %rd19, %rd2, %rd18;    // 输出地址                                                (%rd19 = 输出地址out)
+    ld.global.f32 %f54, [%rd19];   // 加载exp结果                                             (%f54 = 加载out数据, out已经计算好exp(x - max))
+    add.f32 %f84, %f84, %f54;      // 累加到sum                                               (%f84 = 累加out数据到sum)
+    add.s32 %r49, %r49, %r7;       // 增加步长
+    setp.lt.s32 %p12, %r49, %r15;  // 检查越界
+    @%p12 bra $L__BB0_11;          // 继续循环
+
+// Warp内求和归约
+$L__BB0_12:
+    setp.ne.s32 %p13, %r2, 0;      // 检查是否是lane 0
+
+    // Butterfly式求和归约
+    mov.b32 %r35, %f84;            // float转int
+    shfl.sync.bfly.b32 %r36|%p14, %r35, 16, 31, -1;
+    mov.b32 %f55, %r36;
+    add.f32 %f56, %f84, %f55;
+
+    // 下面同理可得，继续归约(8->4->2->1)
+	mov.b32 	%r37, %f56;
+	shfl.sync.bfly.b32	%r38|%p15, %r37, 8, 31, -1;
+	mov.b32 	%f57, %r38;
+	add.f32 	%f58, %f56, %f57;
+
+	mov.b32 	%r39, %f58;
+	shfl.sync.bfly.b32	%r40|%p16, %r39, 4, 31, -1;
+	mov.b32 	%f59, %r40;
+	add.f32 	%f60, %f58, %f59;
+
+	mov.b32 	%r41, %f60;
+	shfl.sync.bfly.b32	%r42|%p17, %r41, 2, 31, -1;
+	mov.b32 	%f61, %r42;
+	add.f32 	%f62, %f60, %f61;
+
+	mov.b32 	%r43, %f62;
+	shfl.sync.bfly.b32	%r44|%p18, %r43, 1, 31, -1;
+	mov.b32 	%f63, %r44;
+    add.f32 %f9, %f62, %f63;       // 最终warp内求和结果                                       (%f9 = warp内求和最终结果) 
+
+    // 存储warp sum到共享内存
+    @%p13 bra $L__BB0_14;          // 非lane 0跳过
+    st.shared.f32 [%r6+32], %f9;    // lane 0存储sum                                          (存储在共享内存sumvals中, sumvals是共享内存首地址+32) 
+
+// 跨warp求和归约
+$L__BB0_14:
+    setp.ne.s32 %p19, %r50, 0;     // 检查是否是线程0
+    bar.sync 0;                    // 同步
+    @%p19 bra $L__BB0_16;          // 非线程0跳过
+
+    // 线程0归约所有warp的sum
+    ld.shared.f32 %f64, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+32];
+    ld.shared.f32 %f65, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+36];
+    add.f32 %f66, %f64, %f65;
+
+    // 下面同理可得，继续累加所有warp的sum
+	ld.shared.f32 	%f67, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+40];
+	add.f32 	%f68, %f66, %f67;
+	ld.shared.f32 	%f69, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+44];
+	add.f32 	%f70, %f68, %f69;
+	ld.shared.f32 	%f71, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+48];
+	add.f32 	%f72, %f70, %f71;
+	ld.shared.f32 	%f73, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+52];
+	add.f32 	%f74, %f72, %f73;
+	ld.shared.f32 	%f75, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+56];
+	add.f32 	%f76, %f74, %f75;
+	ld.shared.f32 	%f77, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+60];
+	add.f32 	%f78, %f76, %f77;
+
+    st.shared.f32 [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+32], %f78; // 存储全局sum, 存储在sumvals[0], 即shared[32]
+
+// 归一化计算
+$L__BB0_16:
+    setp.ge.s32 %p20, %r50, %r15;  // 检查越界
+    bar.sync 0;                    // 同步
+    @%p20 bra $L__BB0_19;          // 越界线程跳过
+
+    ld.shared.f32 %f10, [_ZZ26softmax_f32_per_mat_kernelILi256EEvPfPKfiiE6shared+32];        (%f10 = 加载全局sum的sumvals[0]) 
+    mov.u32 %r12, %ntid.x;         // 获取线程数
+    cvt.u32.u64 %r45, %rd3;        // 行偏移                                                  (%r45 = 64位的行偏移row_offset = C * blockIdx.x)
+
+$L__BB0_18:
+    cvt.s64.s32 %rd20, %r50;       // 线程索引转64位
+    add.s64 %rd21, %rd20, %rd3;    // 全局索引                                                (%rd21 = 全局索引 = 行偏移row_offset + threadIdx.x) 
+    shl.b64 %rd22, %rd21, 2;       // 乘以4
+    add.s64 %rd23, %rd2, %rd22;    // 输出地址                                                (%rd23 = 输出地址 = out + 全局索引) 
+    ld.global.f32 %f79, [%rd23];   // 加载exp值
+    div.rn.f32 %f80, %f79, %f10;   // 除以sum(归一化)
+    add.s32 %r46, %r50, %r45;      // 计算最终输出索引
+    mul.wide.s32 %rd24, %r46, 4;   // 乘以4
+    add.s64 %rd25, %rd2, %rd24;    // 输出地址
+    st.global.f32 [%rd25], %f80;   // 存储最终结果
+    add.s32 %r50, %r50, %r12;      // 增加步长
+    setp.lt.s32 %p21, %r50, %r15;  // 检查是否处理完所有元素
+    @%p21 bra $L__BB0_18;          // 继续循环
+
+// 内核结束
+$L__BB0_19:
+    ret;  // 返回
+}
